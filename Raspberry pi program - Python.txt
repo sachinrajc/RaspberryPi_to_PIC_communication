@@ -1,0 +1,166 @@
+import serial
+import time
+import statistics
+
+# Constants for system modes
+START_UP = 0
+WAITING = 1
+PREHEAT = 2
+CALL_FOR_HEAT = 3
+COOL_DOWN = 4
+
+# Setpoints and timings
+TEMPERATURE_SETPOINT = 22.0  # Setpoint temperature
+HYSTERESIS = 2.0  # Hysteresis to avoid oscillation
+SAMPLING_INTERVAL = 10 # Temperature sampling interval in seconds
+PREHEAT_DURATION = 20  # Time to wait in PREHEAT mode before moving to CALL_FOR_HEAT
+COOL_DOWN_DURATION = 60  # Maximum time to stay in COOL_DOWN mode
+
+# Array to store temperature readings
+temperatures = []
+ARRAY_SIZE = 6  # Stores 1 minute of data (6 samples at 10-second intervals)
+
+# Initialize system mode and timers
+mode = START_UP
+gSampleCount = 0
+cool_down_timer_start = None  # Tracks the start of COOL_DOWN mode
+preheat_timer_start = None  # Tracks the start of PREHEAT mode
+
+
+def calculate_checksum(message):
+    """
+    Calculate the checksum of an NMEA message.
+    """
+    checksum = 0
+    for char in message:
+        checksum ^= ord(char)
+    return checksum
+
+
+def validate_message(nmea_message):
+    """
+    Validate the checksum of an NMEA message.
+    """
+    if not nmea_message.startswith('$') or '*' not in nmea_message:
+        return False
+
+    main_message, checksum_str = nmea_message[1:].split('*', 1)
+    try:
+        received_checksum = int(checksum_str, 16)
+    except ValueError:
+        return False
+
+    calculated_checksum = calculate_checksum(main_message)
+    return calculated_checksum == received_checksum
+
+
+def parse_temperature(nmea_message):
+    """
+    Parse the temperature from a valid NMEA message.
+    """
+    try:
+        main_message = nmea_message.split('*')[0][1:]  # Exclude '$'
+        parts = main_message.split(',')
+        if parts[0] == "TEMP":
+            return float(parts[1])
+    except (IndexError, ValueError):
+        return None
+
+
+def send_command(ser, heat_status, fan_status):
+    command = f"$PIC,HEAT,{heat_status},FAN,{fan_status}"
+    checksum = calculate_checksum(command[1:])
+    command += f"*{checksum:02d}\r\n"
+    ser.write(command.encode('utf-8'))
+    print(f"Sent: {command.strip()}")
+
+
+
+def main():
+    global mode, gSampleCount, temperatures, cool_down_timer_start, preheat_timer_start
+
+    # Replace '/dev/ttyUSB0' with the correct serial port for your setup
+    serial_port = '/dev/ttyAMA2'
+    baud_rate = 19200
+
+    # Open serial port
+    with serial.Serial(serial_port, baud_rate, timeout=1) as ser:
+        print(f"Listening on {serial_port} at {baud_rate} baud...")
+
+        while True:
+            # Read a line from the serial port
+            line = ser.readline().decode('utf-8').strip()
+
+            if line and validate_message(line):
+                print(f"Received: {line}")
+                temp = parse_temperature(line)
+
+                if temp is not None:
+                    # Add temperature to the array
+                    temperatures.append(temp)
+                    gSampleCount += 1
+
+                    if len(temperatures) > ARRAY_SIZE:
+                        temperatures.pop(0)  # Maintain array size
+
+                    avg_temp = statistics.mean(temperatures)
+
+                    # State machine logic
+                    if mode == START_UP:
+                        if gSampleCount >= ARRAY_SIZE:
+                            # Send command to PIC to turn off HEAT and FAN
+                            send_command(ser, "OFF", "OFF")
+                            #print("Sent: $PIC,HEAT,OFF,FAN,OFF")
+                            mode = WAITING
+                            print("Mode: WAITING")
+
+                    elif mode == WAITING:
+                        if avg_temp < TEMPERATURE_SETPOINT:
+                            mode = PREHEAT
+                            preheat_timer_start = time.time()
+                            print("Mode: PREHEAT")
+                            send_command(ser, "ON", "OFF")
+
+                        # Reset sample counter to avoid overflow
+                        if gSampleCount >= ARRAY_SIZE:
+                            gSampleCount = 0
+
+                    elif mode == PREHEAT:
+                        elapsed_time = time.time() - preheat_timer_start
+
+                        # Wait for 20 seconds in PREHEAT mode
+                        if elapsed_time >= PREHEAT_DURATION:
+                            mode = CALL_FOR_HEAT
+                            print("Mode: CALL_FOR_HEAT")
+                            send_command(ser, "ON", "ON")
+
+                    elif mode == CALL_FOR_HEAT:
+                        if avg_temp > 23.0:  # Transition to COOL_DOWN only if temperature > 25°C
+                            mode = COOL_DOWN
+                            cool_down_timer_start = time.time()
+                            print("Mode: COOL_DOWN")
+                            send_command(ser, "OFF", "ON")
+                        else:
+                            print(f"Staying in CALL_FOR_HEAT, Avg Temp: {avg_temp:.1f}°C")
+
+                    elif mode == COOL_DOWN:
+                        elapsed_time = time.time() - cool_down_timer_start
+
+                        if avg_temp < TEMPERATURE_SETPOINT:
+                            mode = PREHEAT
+                            preheat_timer_start = time.time()
+                            print("Mode: PREHEAT")
+                            send_command(ser, "ON", "OFF")
+                        elif elapsed_time >= COOL_DOWN_DURATION:
+                            mode = WAITING
+                            print("Mode: WAITING")
+                            send_command(ser, "OFF", "OFF")
+
+                    # Log the current state
+                    print(f"Temperature: {temp:.1f}°C, Avg: {avg_temp:.1f}°C, Mode: {mode}")
+
+            time.sleep(SAMPLING_INTERVAL)  # Sampling interval
+
+
+if __name__ == "__main__":
+    main()
